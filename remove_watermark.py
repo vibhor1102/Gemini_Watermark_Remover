@@ -1,8 +1,26 @@
-
 import os
 import sys
+import ctypes
 import numpy as np
 from PIL import Image
+
+def enforce_single_instance():
+    # Create a named mutex to ensure only one instance runs
+    # This works for both script and compiled EXE, and independent of visibility
+    mutex_name = "Global\\GeminiWatermarkRemover_Instance_Mutex_v2" 
+    
+    # CreateMutexW returns a handle. We must keep this handle alive for the process duration.
+    # If the mutex already exists, GetLastError returns ERROR_ALREADY_EXISTS (183).
+    kernel32 = ctypes.windll.kernel32
+    mutex = kernel32.CreateMutexW(None, False, mutex_name)
+    
+    last_error = kernel32.GetLastError()
+    if last_error == 183:
+        # Already running
+        print("Another instance is already running. Exiting.")
+        sys.exit(0)
+    
+    return mutex
 
 def get_watermark_info(width, height):
     is_large = width > 1024 and height > 1024
@@ -118,6 +136,10 @@ def remove_watermark_logic(image_path, assets_dir):
 
 if __name__ == "__main__":
     import time
+    
+    # Enforce single instance immediately
+    # We store the mutex to prevent it from being garbage collected
+    _instance_mutex = enforce_single_instance()
 
     def get_resource_path(relative_path):
         """ Get absolute path to resource, works for dev and for PyInstaller """
