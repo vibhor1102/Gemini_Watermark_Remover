@@ -2,7 +2,45 @@ import os
 import sys
 import ctypes
 import numpy as np
+import threading
+import logging
+import subprocess
+import time
 from PIL import Image
+import pystray # pip install pystray
+
+# --- Logging Setup ---
+APP_NAME = "GeminiWatermarkRemover"
+
+def get_app_data_dir():
+    """Get the application data directory."""
+    app_data = os.getenv('APPDATA')
+    if not app_data:
+        app_data = os.path.expanduser("~")
+    
+    app_dir = os.path.join(app_data, APP_NAME)
+    if not os.path.exists(app_dir):
+        os.makedirs(app_dir)
+    return app_dir
+
+def setup_logging():
+    """Configure logging to file and console."""
+    log_dir = os.path.join(get_app_data_dir(), "logs")
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    log_file = os.path.join(log_dir, "app.log")
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logging.info(f"Logging initialized. Log file: {log_file}")
+    return log_file
 
 def enforce_single_instance():
     # Create a named mutex to ensure only one instance runs
@@ -18,6 +56,7 @@ def enforce_single_instance():
     if last_error == 183:
         # Already running
         print("Another instance is already running. Exiting.")
+        logging.warning("Another instance is already running. Exiting.")
         sys.exit(0)
     
     return mutex
@@ -47,6 +86,7 @@ def calculate_alpha_map(bg_image):
 
 def remove_watermark_logic(image_path, assets_dir):
     try:
+        logging.info(f"Processing: {image_path}")
         # Open with context manager to ensure file handle is closed
         with Image.open(image_path) as ref_img:
             img = ref_img.convert('RGB')
@@ -60,6 +100,7 @@ def remove_watermark_logic(image_path, assets_dir):
         bg_path = os.path.join(assets_dir, bg_filename)
         
         if not os.path.exists(bg_path):
+            logging.error(f"Error: Background asset not found at {bg_path}")
             print(f"Error: Background asset not found at {bg_path}")
             return None
 
@@ -127,84 +168,134 @@ def remove_watermark_logic(image_path, assets_dir):
         
         # Save with quality options if needed, but defaults are usually fine for PNG/JPG
         result_img.save(output_path)
+        logging.info(f"Processed and Overwritten: {output_path}")
         print(f"Processed and Overwritten: {output_path}")
         return output_path
 
     except Exception as e:
+        logging.error(f"Error processing {image_path}: {e}")
         print(f"Error processing {image_path}: {e}")
         return None
 
-if __name__ == "__main__":
-    import time
+def get_resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    return os.path.join(base_path, relative_path)
+
+def start_monitoring(assets_dir, stop_event):
+    # Cross-platform way to get Downloads folder
+    # Windows default:
+    downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
     
-    # Enforce single instance immediately
-    # We store the mutex to prevent it from being garbage collected
-    _instance_mutex = enforce_single_instance()
+    logging.info(f"Monitoring {downloads_path} for Gemini images...")
+    print(f"Monitoring {downloads_path} for Gemini images...")
+    
+    seen_files = set()
+    try:
+        # Initial scan to avoid processing old files
+        if os.path.exists(downloads_path):
+            seen_files = set(os.listdir(downloads_path))
+    except Exception as e:
+        logging.error(f"Error accessing downloads: {e}")
+        return
 
-    def get_resource_path(relative_path):
-        """ Get absolute path to resource, works for dev and for PyInstaller """
+    while not stop_event.is_set():
         try:
-            # PyInstaller creates a temp folder and stores path in _MEIPASS
-            base_path = sys._MEIPASS
-        except Exception:
-            base_path = os.path.dirname(os.path.abspath(__file__))
+            # Check every 2 seconds
+            if stop_event.wait(2):
+                break
+                
+            current_files = set(os.listdir(downloads_path))
+            new_files = current_files - seen_files
+            
+            for filename in new_files:
+                if filename.startswith("Gemini_Generated_Image") and filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                    full_path = os.path.join(downloads_path, filename)
+                    
+                    # Wait a moment for file write to complete
+                    time.sleep(1)
+                    
+                    logging.info(f"Detected: {filename}")
+                    print(f"Detected: {filename}")
+                    remove_watermark_logic(full_path, assets_dir)
+            
+            seen_files = current_files
+        except Exception as e:
+            logging.error(f"Error in monitor loop: {e}")
+            time.sleep(5)
 
-        return os.path.join(base_path, relative_path)
+def restart_program(icon):
+    logging.info("Restarting application...")
+    icon.stop()
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
 
-    # Allow asset lookup logic to use this helper
-    # We need to wrap logic to pass the correct asset path
-    # But remove_watermark_logic takes assets_dir.
-    # We can just pass the result of get_resource_path('.') as assets_dir?
-    # No, get_resource_path('bg_48.png') returns full path.
-    # remove_watermark_logic does: os.path.join(assets_dir, bg_filename)
-    # So we should pass the base dir.
+def show_logs():
+    log_dir = os.path.join(get_app_data_dir(), "logs")
+    if os.path.exists(log_dir):
+        os.startfile(log_dir)
+
+def quit_program(icon, stop_event):
+    logging.info("Quitting application...")
+    stop_event.set()
+    icon.stop()
+
+if __name__ == "__main__":
+    _instance_mutex = enforce_single_instance()
+    log_file_path = setup_logging()
     
     ASSETS_DIR = get_resource_path('.')
-
-    def start_monitoring():
-        # Cross-platform way to get Downloads folder
-        # Windows default:
-        downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
+    
+    # Check arguments
+    if len(sys.argv) > 1:
+        # Single File Mode - Just monitor or process?
+        # If user passes a file, process it and exit?
+        # Or if it's just the exe running with arguments (e.g. startup?), usually none.
+        # User request implies running as background service mostly.
+        # But let's keep single file mode if argument is a file path
+        if os.path.isfile(sys.argv[1]):
+            img_path = sys.argv[1]
+            remove_watermark_logic(img_path, ASSETS_DIR)
+            sys.exit(0)
+    
+    # Background Monitor Mode
+    stop_event = threading.Event()
+    
+    # Start monitoring thread
+    monitor_thread = threading.Thread(target=start_monitoring, args=(ASSETS_DIR, stop_event))
+    monitor_thread.daemon = True
+    monitor_thread.start()
+    
+    # System Tray
+    try:
+        icon_path = get_resource_path("bg_48.png")
+        if not os.path.exists(icon_path):
+             # Fallback if image not found, though it should be there
+             # pystray requires an image. We can make a simple one or fail.
+             logging.error(f"Icon not found at {icon_path}")
+             # Create a simple red image
+             image = Image.new('RGB', (64, 64), color = 'red')
+        else:
+            image = Image.open(icon_path)
+            
+        menu = pystray.Menu(
+            pystray.MenuItem("Show Logs", show_logs),
+            pystray.MenuItem("Restart", restart_program),
+            pystray.MenuItem("Quit", lambda icon, item: quit_program(icon, stop_event))
+        )
         
-        print(f"Monitoring {downloads_path} for Gemini images...")
-        print("Press Ctrl+C to exit.")
+        icon = pystray.Icon("GeminiWatermarkRemover", image, "Gemini Watermark Remover", menu)
         
-        seen_files = set()
-        try:
-            # Initial scan to avoid processing old files
-            if os.path.exists(downloads_path):
-                seen_files = set(os.listdir(downloads_path))
-        except Exception as e:
-            print(f"Error accessing downloads: {e}")
-            return
+        logging.info("Starting System Tray Icon...")
+        icon.run()
+        
+    except Exception as e:
+        logging.error(f"Error in main: {e}")
+        stop_event.set()
+        sys.exit(1)
 
-        while True:
-            try:
-                time.sleep(2)
-                current_files = set(os.listdir(downloads_path))
-                new_files = current_files - seen_files
-                
-                for filename in new_files:
-                    if filename.startswith("Gemini_Generated_Image") and filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                        full_path = os.path.join(downloads_path, filename)
-                        
-                        # Wait a moment for file write to complete
-                        time.sleep(1)
-                        
-                        print(f"Detected: {filename}")
-                        remove_watermark_logic(full_path, ASSETS_DIR)
-                
-                seen_files = current_files
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                print(f"Error in monitor loop: {e}")
-                time.sleep(5)
-
-    if len(sys.argv) < 2:
-        # No arguments -> Monitor Mode
-        start_monitoring()
-    else:
-        # Arguments provided -> Single File Mode
-        img_path = sys.argv[1]
-        remove_watermark_logic(img_path, ASSETS_DIR)
