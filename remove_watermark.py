@@ -8,6 +8,8 @@ import subprocess
 import time
 from PIL import Image
 import pystray # pip install pystray
+import configparser
+import argparse
 
 # --- Logging Setup ---
 APP_NAME = "GeminiWatermarkRemover"
@@ -41,6 +43,30 @@ def setup_logging():
     )
     logging.info(f"Logging initialized. Log file: {log_file}")
     return log_file
+
+def setup_config():
+    """Setup and load configuration."""
+    app_dir = get_app_data_dir()
+    config_file = os.path.join(app_dir, "config.ini")
+    
+    config = configparser.ConfigParser()
+    
+    if not os.path.exists(config_file):
+        config['Settings'] = {
+            '; Change this path if your downloads folder is in a different location': '',
+            '; Example: C:\\Users\\YourName\\MyDownloads': '',
+            'downloads_dir': ''
+        }
+        # We need to write comments manually because ConfigParser doesn't persist them well by default
+        # But for simplicity in this script, we'll write a raw string if creating fresh
+        with open(config_file, 'w') as f:
+            f.write("[Settings]\n")
+            f.write("; Change this path if your downloads folder is in a different location\n")
+            f.write("; Example: C:\\Users\\YourName\\MyDownloads\n")
+            f.write("downloads_dir =\n")
+    
+    config.read(config_file)
+    return config, config_file
 
 def enforce_single_instance():
     # Create a named mutex to ensure only one instance runs
@@ -187,10 +213,11 @@ def get_resource_path(relative_path):
 
     return os.path.join(base_path, relative_path)
 
-def start_monitoring(assets_dir, stop_event):
-    # Cross-platform way to get Downloads folder
-    # Windows default:
-    downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
+def start_monitoring(assets_dir, stop_event, downloads_path=None):
+    # Determine downloads path
+    if not downloads_path:
+        # Windows default:
+        downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
     
     logging.info(f"Monitoring {downloads_path} for Gemini images...")
     print(f"Monitoring {downloads_path} for Gemini images...")
@@ -237,8 +264,16 @@ def restart_program(icon):
 
 def show_logs():
     log_dir = os.path.join(get_app_data_dir(), "logs")
-    if os.path.exists(log_dir):
+    log_file = os.path.join(log_dir, "app.log")
+    if os.path.exists(log_file):
+        os.startfile(log_file) # Opens file in default editor/viewer
+    elif os.path.exists(log_dir):
         os.startfile(log_dir)
+
+def edit_config():
+    config_file = os.path.join(get_app_data_dir(), "config.ini")
+    if os.path.exists(config_file):
+        os.startfile(config_file)
 
 def quit_program(icon, stop_event):
     logging.info("Quitting application...")
@@ -251,23 +286,39 @@ if __name__ == "__main__":
     
     ASSETS_DIR = get_resource_path('.')
     
-    # Check arguments
-    if len(sys.argv) > 1:
-        # Single File Mode - Just monitor or process?
-        # If user passes a file, process it and exit?
-        # Or if it's just the exe running with arguments (e.g. startup?), usually none.
-        # User request implies running as background service mostly.
-        # But let's keep single file mode if argument is a file path
-        if os.path.isfile(sys.argv[1]):
-            img_path = sys.argv[1]
-            remove_watermark_logic(img_path, ASSETS_DIR)
-            sys.exit(0)
+    # Parse Arguments
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser.add_argument('input_file', nargs='?', help='Process a single file and exit')
+    parser.add_argument('--downloads-dir', help='Custom downloads directory to monitor')
+    args = parser.parse_args()
+
+    # Load Config
+    config, config_file_path = setup_config()
+    
+    # Determine Downloads Directory Priority:
+    # 1. CLI Argument
+    # 2. Config File
+    # 3. Default (handled in start_monitoring if None passed)
+    
+    monitor_dir = None
+    if args.downloads_dir:
+        monitor_dir = args.downloads_dir
+    elif config.has_option('Settings', 'downloads_dir'):
+        cfg_dir = config.get('Settings', 'downloads_dir').strip()
+        if cfg_dir:
+            monitor_dir = cfg_dir
+
+    # Check arguments for single file mode
+    if args.input_file and os.path.isfile(args.input_file):
+        img_path = args.input_file
+        remove_watermark_logic(img_path, ASSETS_DIR)
+        sys.exit(0)
     
     # Background Monitor Mode
     stop_event = threading.Event()
     
     # Start monitoring thread
-    monitor_thread = threading.Thread(target=start_monitoring, args=(ASSETS_DIR, stop_event))
+    monitor_thread = threading.Thread(target=start_monitoring, args=(ASSETS_DIR, stop_event, monitor_dir))
     monitor_thread.daemon = True
     monitor_thread.start()
     
@@ -285,6 +336,7 @@ if __name__ == "__main__":
             
         menu = pystray.Menu(
             pystray.MenuItem("Show Logs", show_logs),
+            pystray.MenuItem("Edit Config", edit_config),
             pystray.MenuItem("Restart", restart_program),
             pystray.MenuItem("Quit", lambda icon, item: quit_program(icon, stop_event))
         )
